@@ -38,6 +38,8 @@ All modifier functions include shape checks and warnings to protect against comm
 """
 import numpy as np
 import copy
+import numpy as np
+import pandas as pd
 
 class KalmanSpec:
     def __init__(self, K, Q=None, R=None, name="KalmanSpec"):
@@ -90,14 +92,18 @@ class KalmanSpec:
         except:
             return False, "unreadable"
 
-    def describe(self):
+    def describe(self, target_col=None, factor_cols=None):
         is_R_var, R_val = self._inspect_R()
         is_Q_var, Q_val = self._inspect_Q()
         is_T_var, T_val = self._inspect_T()
 
+        T0 = self.transition_fn(0)
+
         return {
             "model_name": self.name,
             "state_dim": self.K,
+            "target_col": target_col,
+            "factor_cols": factor_cols,
             "initial_beta_0": self.beta_0.flatten().tolist(),
             "initial_P_0_diag": np.diag(self.P_0).tolist(),
             "Q": Q_val,
@@ -106,7 +112,11 @@ class KalmanSpec:
             "initialization": self.init_method,
             "has_intercept": self.K > 1 and np.allclose(self.beta_0[0], 0),
             "is_adaptive_R": is_R_var,
-            "is_AR1": "AR1" in self.name
+            "is_AR1": "AR1" in self.name or np.allclose(T0, T0[0, 0] * np.eye(self.K)),
+            "AR1_phi": T0[0, 0] if np.allclose(T0, T0[0, 0] * np.eye(self.K)) else None,
+            "Q_scale": float(np.mean(np.diag(self.process_noise_fn(0)))) if not is_Q_var else "time-varying",
+            "R_scale": float(self.obs_noise_fn(0)[0, 0]) if not is_R_var else "time-varying",
+            "transition_matrix_T_0": T0.tolist()
         }
 
     def summary_str(self):
@@ -140,7 +150,6 @@ class KalmanSpec:
 
         # Expand observation_fn
         self.observation_fn = lambda t, H_t: np.hstack([np.ones(1), H_t]).reshape(1, self.K)
-
         self.name += "_with_intercept"
         return self
 
@@ -195,6 +204,14 @@ class KalmanSpec:
             raise NotImplementedError(f"Unknown init method: {method}")
         return self
 
+    def estimate_R_from_ols(self, H, y):
+        beta_ols = np.linalg.lstsq(H, y, rcond=None)[0]
+        residuals = y - H @ beta_ols
+        R = np.var(residuals)
+        self.obs_noise_fn = lambda t: np.array([[R]])
+        self.name += "_init_R_ols"
+        return self
+
 class KalmanEngine:
     def __init__(self, spec):
         self.spec = spec
@@ -207,12 +224,16 @@ class KalmanEngine:
             + (innovation.T @ np.linalg.inv(S) @ innovation)[0, 0]
         )
 
-    def run(self, y, H, burn=0):
+    def run(self, df, target_col, factor_cols, burn=0):
+        y = df[[target_col]].values
+        H = df[factor_cols].values
+        index = df.index
+
         self.spec.validate(y, H)
         T_steps, K = len(y), self.spec.K
 
         beta_preds = np.zeros((T_steps, K))
-        beta_covs = np.zeros((T_steps, K, K))
+        beta_covs = []
         y_preds = np.zeros(T_steps)
         innovations = np.zeros(T_steps)
         kalman_gains = np.zeros((T_steps, K))
@@ -229,22 +250,25 @@ class KalmanEngine:
             H_obs_t = self.spec.observation_fn(t, H_t)
             R_t = self.spec.obs_noise_fn(t)
 
+            # Prediction step
             beta_pred = T_t @ beta_prev
             P_pred = T_t @ P_prev @ T_t.T + Q_t
 
+            # Measrurement step
             y_hat = H_obs_t @ beta_pred
             innovation = y_t - y_hat
             S = H_obs_t @ P_pred @ H_obs_t.T + R_t
             K_t = P_pred @ H_obs_t.T @ np.linalg.inv(S)
 
+            # Update step
             beta_post = beta_pred + K_t @ innovation
             P_post = (np.eye(K) - K_t @ H_obs_t) @ P_pred
 
+            # Store results and calculate log-likelihood
             log_likelihoods[t] = self._log_likelihood(innovation, S)
 
-
             beta_preds[t] = beta_post.flatten()
-            beta_covs[t] = P_post
+            beta_covs.append(P_post)
             y_preds[t] = y_hat
             innovations[t] = innovation
             kalman_gains[t] = K_t.flatten()
@@ -252,16 +276,22 @@ class KalmanEngine:
             beta_prev = beta_post
             P_prev = P_post
 
-        return {
-            "beta": beta_preds[burn:],
-            "beta_cov": beta_covs[burn:],
-            "y_pred": y_preds[burn:],
-            "residuals": innovations[burn:],
-            "kalman_gain": kalman_gains[burn:],
-            "log_likelihood": np.sum(log_likelihoods[burn:]),
-            "log_likelihood_t": log_likelihoods[burn:]
-        }
+        # --- Slice burn-in period ---
+        idx = slice(burn, None)
+        time_index = df.index[burn:]
+        cols = factor_cols
 
+        return {
+            "beta": pd.DataFrame(beta_preds[idx], index=time_index, columns=cols),
+            "beta_cov": dict(zip(time_index, beta_covs[burn:])),
+            "y_pred": pd.Series(y_preds[idx], index=time_index, name="y_pred"),
+            "residuals": pd.Series(innovations[idx], index=time_index, name="residuals"),
+            "kalman_gain": pd.DataFrame(kalman_gains[idx], index=time_index, columns=cols),
+            "log_likelihood": np.sum(log_likelihoods[burn:]),
+            "log_likelihood_t": pd.Series(log_likelihoods[burn:], index=time_index, name="log_likelihood"),
+            "meta": self.spec.describe(target_col=target_col, factor_cols=factor_cols),
+            "H": pd.DataFrame(H[idx], index=time_index, columns=factor_cols)
+        }
 
 class KalmanMLEOptimizer:
     def __init__(self, spec_template, y, H, burn=0):

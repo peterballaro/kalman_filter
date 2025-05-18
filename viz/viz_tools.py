@@ -29,7 +29,7 @@ def get_sci_template():
                 "linecolor": "black",
                 "ticks": "outside",
                 "tickfont": {"size": 14},
-                "hoverformat": ".2f",
+                #"hoverformat": ".2f",
                 "title": {"standoff": 10}
             },
             "yaxis": {
@@ -42,19 +42,19 @@ def get_sci_template():
                 "hoverformat": ".2f",
                 "title": {"standoff": 10}
             },
-            "yaxis2": {
-                "overlaying": "y",
-                "side": "left",
-                "position": 0.02,
-                "showgrid": False,
-                "showline": True,
-                "tickcolor": "#ff6600",
-                "linecolor": "black",
-                "tickfont": {"size": 14, "color": "#ff6600"},
-                "titlefont": {"color": "#ff6600"},
-                "title": {"standoff": 8},
-                "ticklabelposition": "inside"
-            },
+            # "yaxis2": {
+            #     "overlaying": "y",
+            #     "side": "left",
+            #     "position": 0.02,
+            #     "showgrid": False,
+            #     "showline": True,
+            #     "tickcolor": "#ff6600",
+            #     "linecolor": "black",
+            #     "tickfont": {"size": 14, "color": "#ff6600"},
+            #     "titlefont": {"color": "#ff6600"},
+            #     "title": {"standoff": 8},
+            #     "ticklabelposition": "inside"
+            # },
             "legend": {
                 "orientation": "v",
                 "xanchor": "left",
@@ -156,47 +156,223 @@ def attach_line_end_labels(
                 print(f"[attach_line_end_labels] Skipped trace '{trace_name}' (index {i}): {e}")
     return fig
 
-def safe_center_dual_yaxes(
-    fig: Figure,
+def style_and_center_dual_yaxes(
+    fig: go.Figure,
     center_y1: Optional[float] = None,
     center_y2: Optional[float] = None,
     margin: float = 0.1,
+    style_secondary: bool = True,
+    secondary_title: str = "Secondary",
+    secondary_color: str = "#ff6600",
+    secondary_position: float = 0.02,
+    inside_ticks: bool = True,
     verbose: bool = False
-) -> Figure:
+) -> go.Figure:
+    """
+    Styles and centers primary and secondary y-axes. Adds yaxis2 if needed.
+    Now robust to multiple subplots (y3, y4, ...).
+    """
+
     def get_bounds(values, center):
         span = max(abs(max(values) - center), abs(min(values) - center))
         return center - (1 + margin) * span, center + (1 + margin) * span
 
-    y1_values = []
-    y2_values = []
-    y2_used = False
-
+    # Collect y values for each axis (y, y2, y3, ...)
+    axis_yvals = {}
     for trace in fig.data:
-        if not isinstance(trace, (go.Scatter, go.Scattergl)):
-            continue
-        if trace.y is None or len(trace.y) == 0:
-            continue
+        if isinstance(trace, (go.Scatter, go.Scattergl, go.Bar)):
+            y = trace.y
+            if y is None or len(y) == 0:
+                continue
+            axis = getattr(trace, "yaxis", "y")  # e.g., 'y', 'y2', 'y3', ...
+            axis_yvals.setdefault(axis, []).extend(y)
 
-        axis = getattr(trace, "yaxis", "y")
-        if axis == "y2":
-            y2_values.extend(trace.y)
-            y2_used = True
-        else:
-            y1_values.extend(trace.y)
+    # Find all yaxis keys in layout (e.g., yaxis, yaxis2, yaxis3, ...)
+    layout_axes = [k for k in fig.layout if k.startswith("yaxis")]
+    # Always include 'yaxis' if not present
+    if "yaxis" not in layout_axes:
+        layout_axes.insert(0, "yaxis")
 
-    if center_y1 is not None and y1_values:
-        y1_min, y1_max = get_bounds(y1_values, center_y1)
-        fig.layout.yaxis.range = [y1_min, y1_max]
-        if verbose:
-            print(f"yaxis centered on {center_y1} with range: ({y1_min:.2f}, {y1_max:.2f})")
+    # Map axis name (y, y2, y3, ...) to layout key (yaxis, yaxis2, ...)
+    def axis_to_layout(axis):
+        if axis == "y":
+            return "yaxis"
+        elif axis.startswith("y") and axis[1:].isdigit():
+            return f"yaxis{axis[1:]}"
+        return axis
 
-    if center_y2 is not None:
-        if "yaxis2" in fig.layout and y2_values:
-            y2_min, y2_max = get_bounds(y2_values, center_y2)
-            fig.layout.yaxis2.range = [y2_min, y2_max]
+    # Center and style each axis
+    for axis, yvals in axis_yvals.items():
+        layout_key = axis_to_layout(axis)
+        # Determine which center to use
+        if axis == "y" and center_y1 is not None:
+            y_min, y_max = get_bounds(yvals, center_y1)
+            fig.update_layout({layout_key: dict(range=[y_min, y_max])})
             if verbose:
-                print(f"yaxis2 centered on {center_y2} with range: ({y2_min:.2f}, {y2_max:.2f})")
-        elif verbose:
-            print("Warning: yaxis2 not found in layout. Skipping secondary centering.")
+                print(f"{layout_key} centered on {center_y1}: ({y_min:.2f}, {y_max:.2f})")
+        elif axis == "y2" and center_y2 is not None:
+            y_min, y_max = get_bounds(yvals, center_y2)
+            if style_secondary or not hasattr(fig.layout, layout_key):
+                fig.update_layout({
+                    layout_key: dict(
+                        overlaying="y",
+                        side="left",
+                        position=secondary_position,
+                        showgrid=False,
+                        showline=True,
+                        tickcolor=secondary_color,
+                        linecolor="black",
+                        tickfont=dict(size=14, color=secondary_color),
+                        titlefont=dict(color=secondary_color),
+                        title=dict(text=secondary_title, standoff=8),
+                        ticklabelposition="inside" if inside_ticks else "outside",
+                        range=[y_min, y_max]
+                    )
+                })
+                if verbose:
+                    print(f"{layout_key} centered on {center_y2}: ({y_min:.2f}, {y_max:.2f})")
+            else:
+                fig.update_layout({layout_key: dict(range=[y_min, y_max])})
+        else:
+            # For additional axes (y3, y4, ...), just center if possible
+            # Optionally, you could add more styling logic here
+            if yvals:
+                center = (max(yvals) + min(yvals)) / 2
+                y_min, y_max = get_bounds(yvals, center)
+                fig.update_layout({layout_key: dict(range=[y_min, y_max])})
+                if verbose:
+                    print(f"{layout_key} auto-centered: ({y_min:.2f}, {y_max:.2f})")
 
     return fig
+
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from viz.viz_tools import attach_line_end_labels
+
+def plot_beta_grid(results: dict, n_cols: int = 3, show_gain: bool = False) -> go.Figure:
+    """
+    Grid of subplots for each factor showing:
+    - Beta path (blue)
+    - ±1 std shading
+    - Optional Kalman gain overlay on secondary y-axis (dotted orange)
+    - Optional dashed line at y=0 if beta crosses zero
+    - End-of-line labels for beta traces only (via attach_line_end_labels)
+    """
+    beta = results["beta"]
+    gain = results["kalman_gain"]
+    index = beta.index
+    factors = beta.columns.tolist()
+
+    n_factors = len(factors)
+    cols = min(n_cols, n_factors)
+    rows = int(np.ceil(n_factors / cols))
+
+    fig = make_subplots(
+        rows=rows,
+        cols=cols,
+        subplot_titles=factors,
+        shared_xaxes=False,
+        shared_yaxes=False,
+        specs=[[{"secondary_y": True} for _ in range(cols)] for _ in range(rows)],
+        vertical_spacing=0.10,
+        horizontal_spacing=0.05
+    )
+
+    row, col = 1, 1
+    trace_names = []
+
+    for factor in factors:
+        beta_series = beta[factor]
+        gain_series = gain[factor]
+        std = beta_series.std()
+        upper_band = beta_series + std
+        lower_band = beta_series - std
+
+        # --- Beta Trace ---
+        beta_trace_name = f"{factor} β"
+        trace_names.append(beta_trace_name)
+
+        beta_trace = go.Scatter(
+            x=index,
+            y=beta_series,
+            name=beta_trace_name,
+            mode="lines",
+            line=dict(color="royalblue", width=2),
+            showlegend=False
+        )
+
+        # --- Shaded ±1 std ---
+        band_trace = go.Scatter(
+            x=list(index) + list(index[::-1]),
+            y=list(upper_band) + list(lower_band[::-1]),
+            fill="toself",
+            fillcolor="rgba(65, 105, 225, 0.15)",
+            line=dict(color="rgba(255,255,255,0)"),
+            hoverinfo="skip",
+            showlegend=False
+        )
+
+        fig.add_trace(band_trace, row=row, col=col)
+        fig.add_trace(beta_trace, row=row, col=col, secondary_y=False)
+
+        # --- Kalman Gain Trace (optional) ---
+        if show_gain:
+            gain_trace = go.Scatter(
+                x=index,
+                y=gain_series,
+                name=f"{factor} Gain",
+                mode="lines",
+                line=dict(color="darkorange", width=1.5, dash="dot"),
+                showlegend=False
+            )
+            fig.add_trace(gain_trace, row=row, col=col, secondary_y=True)
+
+        # --- y = 0 line if beta crosses zero
+        if beta_series.min() < 0 and beta_series.max() > 0:
+            fig.add_trace(go.Scatter(
+                x=[index[0], index[-1]],
+                y=[0, 0],
+                mode="none", 
+                line=dict(color="gray", width=1, dash="dash"),
+                hoverinfo="skip",
+                showlegend=False
+            ), row=row, col=col, secondary_y=False)
+
+        # --- Clean axis labels
+        fig.update_yaxes(title_text=None, row=row, col=col, secondary_y=False)
+        if show_gain:
+            fig.update_yaxes(title_text=None, row=row, col=col, secondary_y=True)
+
+        col += 1
+        if col > cols:
+            col = 1
+            row += 1
+
+        # --- Layout
+    # --- Extract model name from metadata
+    model_name = results.get("meta", {}).get("model_name", "Model")
+
+    fig.update_layout(
+        height=300 * rows,
+        width=1100,
+        title_text=f"{model_name} – Betas",
+        template="sci_template",
+        hovermode=None,
+        margin=dict(t=60, b=40)
+    )
+
+    # --- Apply end labels only to β lines
+    attach_line_end_labels(
+        fig,
+        trace_names=trace_names,
+        font_size=13,
+        text_anchor='middle left'
+    )
+
+    # --- Ensure no y-axis titles anywhere
+    for i in range(1, len(fig.layout.annotations) + 1):
+        fig.update_layout({f"yaxis{i}": dict(title=None)})
+
+    return fig
+
