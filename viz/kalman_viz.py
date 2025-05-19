@@ -23,6 +23,10 @@ ALL_PANELS = DEFAULT_PANELS + [
     "cumulative_resid"
 ]
 
+def drop_static_components(df: pd.DataFrame, exclude: list[str] = ["Intercept"]) -> pd.DataFrame:
+    return df.drop(columns=[c for c in exclude if c in df.columns], errors="ignore")
+
+
 class ModelDiagnosticsPlotter:
     def __init__(self, results):
         self.results = results
@@ -265,45 +269,27 @@ def summarize_model_diagnostics(results: dict) -> pd.DataFrame:
     meta = results.get("meta", {})
     residuals = results["residuals"]
     y_pred = results["y_pred"]
-
-    # --- Basic dimensions ---
     index = residuals.index
     n_obs = len(residuals)
     date_range = f"{index[0].date()} → {index[-1].date()}"
 
-    # --- RMSE ---
     rmse_series = (residuals**2).rolling(window=1).mean().apply(np.sqrt)
     final_rmse = rmse_series.iloc[-1]
     mean_rmse = np.sqrt(np.mean(residuals**2))
-
-    # --- Sum of Squared Errors (SSE) ---
     sse = np.sum(residuals**2)
 
-    # --- Log-likelihood ---
     ll = results.get("log_likelihood_t", None)
-    if ll is not None:
-        log_likelihood_total = ll.sum()
-    else:
-        log_likelihood_total = np.nan
+    log_likelihood_total = ll.sum() if ll is not None else np.nan
 
-    # --- Gain norm (L2) ---
-    gains = results.get("kalman_gain", None)
-    if gains is not None:
-        gain_norms = gains.apply(np.linalg.norm, axis=1)
-        mean_gain_norm = gain_norms.mean()
-    else:
-        mean_gain_norm = np.nan
+    gains = drop_static_components(results.get("kalman_gain", pd.DataFrame()))
+    gain_norms = gains.apply(np.linalg.norm, axis=1) if not gains.empty else None
+    mean_gain_norm = gain_norms.mean() if gain_norms is not None else np.nan
 
-    # --- Drift norm (L2) ---
-    betas = results.get("beta", None)
-    if betas is not None:
-        drift = betas.diff().dropna().apply(np.linalg.norm, axis=1)
-        mean_drift_norm = drift.mean()
-    else:
-        mean_drift_norm = np.nan
+    betas = drop_static_components(results.get("beta", pd.DataFrame()))
+    drift = betas.diff().dropna().apply(np.linalg.norm, axis=1) if not betas.empty else None
+    mean_drift_norm = drift.mean() if drift is not None else np.nan
 
-    # --- Assemble table ---
-    row = {
+    return pd.DataFrame([{
         "Model Name": meta.get("model_name", "Unknown"),
         "Target": meta.get("target_col", "y"),
         "Date Range": date_range,
@@ -314,9 +300,8 @@ def summarize_model_diagnostics(results: dict) -> pd.DataFrame:
         "Cumulative Log-Likelihood": round(log_likelihood_total, 6),
         "Mean Gain Norm": round(mean_gain_norm, 6),
         "Mean Drift Norm": round(mean_drift_norm, 6)
-    }
+    }])
 
-    return pd.DataFrame([row])
 
 def summarize_factor_dynamics(results: dict) -> pd.DataFrame:
     """
@@ -338,7 +323,7 @@ def summarize_factor_dynamics(results: dict) -> pd.DataFrame:
     beta = results["beta"]  # T × K DataFrame
     gains = results.get("kalman_gain")  # T × K DataFrame or None
     H = results["H"]  # T × K DataFrame
-
+    meta = results.get("meta", {})
     summaries = []
 
     for factor in beta.columns:
@@ -354,6 +339,7 @@ def summarize_factor_dynamics(results: dict) -> pd.DataFrame:
         z_score = (final_beta - mean_beta) / std_beta if std_beta > 0 else np.nan
 
         row = {
+            "Model Name": meta.get("model_name", "Unknown"),
             "Factor": factor,
             "Avg Beta": mean_beta,
             "Beta Std": std_beta,
@@ -444,5 +430,132 @@ def plot_factor_contributions(results: dict, include_factors: list[str] | None =
     )
 
     return fig
+
+def plot_beta_grid(results: dict, n_cols: int = 3, show_gain: bool = False) -> go.Figure:
+    """
+    Grid of subplots for each factor showing:
+    - Beta path (blue)
+    - ±1 std shading
+    - Optional Kalman gain overlay on secondary y-axis (dotted orange)
+    - Optional dashed line at y=0 if beta crosses zero
+    - End-of-line labels for beta traces only (via attach_line_end_labels)
+    """
+    beta = results["beta"]
+    gain = results["kalman_gain"]
+    index = beta.index
+    factors = beta.columns.tolist()
+
+    n_factors = len(factors)
+    cols = min(n_cols, n_factors)
+    rows = int(np.ceil(n_factors / cols))
+
+    fig = make_subplots(
+        rows=rows,
+        cols=cols,
+        subplot_titles=factors,
+        shared_xaxes=False,
+        shared_yaxes=False,
+        specs=[[{"secondary_y": True} for _ in range(cols)] for _ in range(rows)],
+        vertical_spacing=0.10,
+        horizontal_spacing=0.05
+    )
+
+    row, col = 1, 1
+    trace_names = []
+
+    for factor in factors:
+        beta_series = beta[factor]
+        gain_series = gain[factor]
+        std = beta_series.std()
+        upper_band = beta_series + std
+        lower_band = beta_series - std
+
+        # --- Beta Trace ---
+        beta_trace_name = f"{factor} β"
+        trace_names.append(beta_trace_name)
+
+        beta_trace = go.Scatter(
+            x=index,
+            y=beta_series,
+            name=beta_trace_name,
+            mode="lines",
+            line=dict(color="royalblue", width=2),
+            showlegend=False
+        )
+
+        # --- Shaded ±1 std ---
+        band_trace = go.Scatter(
+            x=list(index) + list(index[::-1]),
+            y=list(upper_band) + list(lower_band[::-1]),
+            fill="toself",
+            fillcolor="rgba(65, 105, 225, 0.15)",
+            line=dict(color="rgba(255,255,255,0)"),
+            hoverinfo="skip",
+            showlegend=False
+        )
+
+        fig.add_trace(band_trace, row=row, col=col)
+        fig.add_trace(beta_trace, row=row, col=col, secondary_y=False)
+
+        # --- Kalman Gain Trace (optional) ---
+        if show_gain:
+            gain_trace = go.Scatter(
+                x=index,
+                y=gain_series,
+                name=f"{factor} Gain",
+                mode="lines",
+                line=dict(color="darkorange", width=1.5, dash="dot"),
+                showlegend=False
+            )
+            fig.add_trace(gain_trace, row=row, col=col, secondary_y=True)
+
+        # --- y = 0 line if beta crosses zero
+        if beta_series.min() < 0 and beta_series.max() > 0:
+            fig.add_trace(go.Scatter(
+                x=[index[0], index[-1]],
+                y=[0, 0],
+                mode="none",  # ✅ ensures no end labels applied
+                line=dict(color="gray", width=1, dash="dash"),
+                hoverinfo="skip",
+                showlegend=False
+            ), row=row, col=col, secondary_y=False)
+
+        # --- Clean axis labels
+        fig.update_yaxes(title_text=None, row=row, col=col, secondary_y=False)
+        if show_gain:
+            fig.update_yaxes(title_text=None, row=row, col=col, secondary_y=True)
+
+        col += 1
+        if col > cols:
+            col = 1
+            row += 1
+
+        # --- Layout
+    # --- Extract model name from metadata
+    model_name = results.get("meta", {}).get("model_name", "Model")
+
+    fig.update_layout(
+        height=300 * rows,
+        width=1100,
+        title_text=f"{model_name} – Betas",
+        template="sci_template",
+        hovermode=None,
+        margin=dict(t=60, b=40)
+    )
+
+    # --- Apply end labels only to β lines
+    attach_line_end_labels(
+        fig,
+        trace_names=trace_names,
+        font_size=13,
+        text_anchor='middle left'
+    )
+
+    # --- Ensure no y-axis titles anywhere
+    for i in range(1, len(fig.layout.annotations) + 1):
+        fig.update_layout({f"yaxis{i}": dict(title=None)})
+
+    return fig
+
 
 
