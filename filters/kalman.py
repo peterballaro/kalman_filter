@@ -78,7 +78,6 @@ class KalmanSpec:
         return self
 
     def set_R_from_mle(self, df, target_col, factor_cols, burn=0):
-
         best_R, _ = estimate_mle_R(self.copy(), df, target_col, factor_cols, burn=burn)
         self.obs_noise_fn = lambda t: np.array([[best_R]])
         self.meta = getattr(self, "meta", {})
@@ -92,7 +91,7 @@ class KalmanSpec:
         self.process_noise_fn = lambda t: Q
         return self
 
-    def estimate_R_from_ols(self, H, y):
+    def set_R_from_ols(self, H, y):
         if self.has_intercept:
             H = np.hstack([np.ones((H.shape[0], 1)), H])
         beta_ols = np.linalg.pinv(H) @ y
@@ -100,8 +99,29 @@ class KalmanSpec:
         R = np.var(residuals)
         self.obs_noise_fn = lambda t: np.array([[R]])
         return self
+    
+    def set_R_from_rolling_factor_vols(spec, H: pd.DataFrame, window: int = 20, min_val: float = 1e-6):
+        """
+        Sets R_t as a function of rolling average factor volatility.
+        
+        Parameters:
+            spec: KalmanSpec instance
+            H: DataFrame of factor returns (T × K)
+            window: rolling window size
+            min_val: floor value to avoid zero variance
 
-    def estimate_initial_state(self, H, y):
+        Returns:
+            Updated KalmanSpec with obs_noise_fn set dynamically
+        """
+        avg_vol = H.rolling(window).std().mean(axis=1)
+        R_series = (avg_vol ** 2).clip(lower=min_val).fillna(method="bfill")
+
+        spec.obs_noise_fn = lambda t: np.array([[R_series.iloc[t]]])
+        spec.meta = getattr(spec, "meta", {})
+        spec.meta["R_mode"] = f"factor_vol_window_{window}"
+        return spec
+
+    def set_initial_state_from_ols(self, H, y):
         if self.has_intercept:
             H = np.hstack([np.ones((H.shape[0], 1)), H])
         beta_ols = np.linalg.pinv(H) @ y
@@ -169,9 +189,13 @@ class KalmanEngine:
             H_obs_t = self.spec.observation_fn(t, H_t)
             R_t = self.spec.obs_noise_fn(t)
 
+            # Use posteior from previous tep for prior in this step
             beta_pred = T_t @ beta_prev
+            # Uncertainty in the prior will always be higher than postetior 
             P_pred = T_t @ P_prev @ T_t.T + Q_t
 
+            # Update stage
+            # residual 
             y_hat = H_obs_t @ beta_pred
             innovation = y_t - y_hat
             S = H_obs_t @ P_pred @ H_obs_t.T + R_t
