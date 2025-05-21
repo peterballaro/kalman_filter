@@ -48,6 +48,16 @@ class ModelDiagnosticsPlotter:
     def plot(self, include=None, height_per_row=300):
         if include is None:
             include = DEFAULT_PANELS
+        elif not isinstance(include, list):
+            raise TypeError("`include` must be a list of plot names or None.")
+
+        # Validate plot types
+        valid_plots = list(self.available_plots.keys())
+        invalid = [name for name in include if name not in valid_plots]
+        if invalid:
+            print(f"Invalid plot type(s): {invalid}")
+            print(f"Valid plot types are: {valid_plots}")
+            raise ValueError(f"Invalid plot type(s): {invalid}")
 
         self.annotations = []
         n = len(include)
@@ -424,7 +434,6 @@ def plot_factor_contributions(results: dict, include_factors: list[str] | None =
         title="Factor Contributions to Predicted Return Over Time",
         xaxis_title="Date",
         yaxis_title="Predicted Return",
-        hovermode="x unified",
         template="sci_template",  
         legend_title="Factors"
     )
@@ -514,7 +523,7 @@ def plot_beta_grid(results: dict, n_cols: int = 3, show_gain: bool = False) -> g
             fig.add_trace(go.Scatter(
                 x=[index[0], index[-1]],
                 y=[0, 0],
-                mode="none",  # ✅ ensures no end labels applied
+                mode="none", 
                 line=dict(color="gray", width=1, dash="dash"),
                 hoverinfo="skip",
                 showlegend=False
