@@ -224,8 +224,47 @@ class ModelDiagnosticsPlotter:
 
     def _plot_residuals(self):
         resid = self.results["residuals"]
-        trace = go.Scatter(x=resid.index, y=resid.values, mode="lines", name="Residuals")
-        return list(self._make_labeled_trace(trace))
+        std = resid.std()
+        upper = 1.96 * std
+        lower = -1.96 * std
+
+        trace_resid = go.Scatter(
+            x=resid.index,
+            y=resid.values,
+            mode="lines",
+            name="Residuals",
+            line=dict(color="blue")
+        )
+
+        trace_upper = go.Scatter(
+            x=resid.index,
+            y=[upper] * len(resid),
+            mode="lines",
+            name="+1.96 SD",
+            line=dict(color="red", dash="dash")
+        )
+
+        trace_lower = go.Scatter(
+            x=resid.index,
+            y=[lower] * len(resid),
+            mode="lines",
+            name="-1.96 SD",
+            line=dict(color="red", dash="dash")
+        )
+
+        extreme_outliers = resid[(resid > 3.5 * std) | (resid < -3.5 * std)]
+        trace_labels = go.Scatter(
+            x=extreme_outliers.index,
+            y=extreme_outliers.values,
+            mode="text",
+            text=[d.strftime("%Y-%m-%d") for d in extreme_outliers.index],
+            textposition="top center",
+            textfont=dict(size=11, color="black"),
+            showlegend=False,
+            hoverinfo="skip"
+        )
+
+        return [trace_resid, trace_upper, trace_lower, trace_labels]
 
     def _plot_log_likelihood(self):
         ll = self.results.get("log_likelihood_t")

@@ -1,15 +1,15 @@
 import numpy as np
 import pandas as pd
-
-import numpy as np
 from scipy.optimize import minimize
+from typing import Callable
 
-def estimate_mle_R(spec_template, df, target_col, factor_cols, burn=0, method='L-BFGS-B', bounds=(1e-6, 1e2)):
+
+def estimate_mle_R(spec_template, df: pd.DataFrame, target_col: str, factor_cols: list[str], burn: int = 0,
+                    method: str = 'L-BFGS-B', bounds: tuple = (1e-6, 1e2)) -> tuple[float, minimize]:
     def neg_log_likelihood(log_R_scalar):
         R_val = np.exp(log_R_scalar)
         spec = spec_template.copy()
         spec.obs_noise_fn = lambda t: np.array([[R_val]])
-
         engine = KalmanEngine(spec)
         results = engine.run(df, target_col=target_col, factor_cols=factor_cols, burn=burn)
         return -results["log_likelihood"]
@@ -26,12 +26,12 @@ def estimate_mle_R(spec_template, df, target_col, factor_cols, burn=0, method='L
     return best_R, result
 
 
-def estimate_mle_Q(spec_template, df, target_col, factor_cols, burn=0, method='L-BFGS-B', bounds=(1e-8, 1e1)):
+def estimate_mle_Q(spec_template, df: pd.DataFrame, target_col: str, factor_cols: list[str], burn: int = 0,
+                    method: str = 'L-BFGS-B', bounds: tuple = (1e-8, 1e1)) -> tuple[float, minimize]:
     def neg_log_likelihood(log_Q_scalar):
         Q_val = np.exp(log_Q_scalar)
         spec = spec_template.copy()
         spec.process_noise_fn = lambda t: np.eye(spec.K) * Q_val
-
         engine = KalmanEngine(spec)
         results = engine.run(df, target_col=target_col, factor_cols=factor_cols, burn=burn)
         return -results["log_likelihood"]
@@ -49,19 +49,18 @@ def estimate_mle_Q(spec_template, df, target_col, factor_cols, burn=0, method='L
 
 
 class KalmanSpec:
-    def __init__(self, K, name="Kalman Model"):
+    def __init__(self, K: int, name: str = "Kalman Model"):
         self.K = K
         self.name = name
         self.beta_0 = np.zeros((K, 1))
         self.P_0 = np.eye(K) * 1e2
-        self.transition_fn = lambda t: np.eye(self.K)
-        self.process_noise_fn = lambda t: np.eye(self.K) * 1e-4
-        self.observation_fn = lambda t, H_t: H_t.reshape(1, self.K)
-        self.obs_noise_fn = lambda t: np.eye(1) * 1e-2
-        self.has_intercept = False
+        self.transition_fn: Callable[[int], np.ndarray] = lambda t: np.eye(self.K)
+        self.process_noise_fn: Callable[[int], np.ndarray] = lambda t: np.eye(self.K) * 1e-4
+        self.observation_fn: Callable[[int, np.ndarray], np.ndarray] = lambda t, H_t: H_t.reshape(1, self.K)
+        self.obs_noise_fn: Callable[[int], np.ndarray] = lambda t: np.eye(1) * 1e-2
+        self.has_intercept: bool = False
 
-    def add_intercept(self, init_val: float = 0.0):
-        # TODO Interface this better with the rest of the code.
+    def add_intercept(self, init_val: float = 0.0) -> 'KalmanSpec':
         self.K += 1
         self.beta_0 = np.insert(self.beta_0, 0, init_val).reshape(-1, 1)
         self.P_0 = np.pad(self.P_0, ((1, 0), (1, 0)), mode="constant")
@@ -70,80 +69,196 @@ class KalmanSpec:
         self.observation_fn = lambda t, H_t: np.hstack([np.ones(1), H_t]).reshape(1, self.K)
         return self
 
-    def set_Q_from_mle(self, df, target_col, factor_cols, burn=0):
+    def set_initial_state_from_ols(self, H: pd.DataFrame, y: pd.Series) -> 'KalmanSpec':
+        H_mat = H.copy()
+        if self.has_intercept:
+            H_mat = pd.concat([pd.Series(1.0, index=H.index, name="Intercept"), H], axis=1)
+        beta_ols = np.linalg.pinv(H_mat.values) @ y.values
+        self.beta_0 = beta_ols.reshape(-1, 1)
+        return self
+
+    def set_Q_from_factor_vols(self, H: pd.DataFrame) -> 'KalmanSpec':
+        Q = np.diag(H.var().values)
+        if self.has_intercept:
+            Q = np.pad(Q, ((1, 0), (1, 0)), mode="constant")
+        self.process_noise_fn = lambda t: Q
+        return self
+    
+    def set_Q_from_rolling_beta_var(
+        self,
+        df: pd.DataFrame,
+        target_col: str,
+        factor_cols: list[str],
+        window: int = 20,
+        min_val: float = 1e-8,
+        scale: float = 1.0
+    ) -> 'KalmanSpec':
+        """
+        Set Q_t using rolling OLS beta variance.
+        Useful for tracking recent instability in factor exposures.
+        """
+        y = df[target_col]
+        H = df[factor_cols]
+
+        if self.has_intercept:
+            H = pd.concat([pd.Series(1.0, index=H.index, name="Intercept"), H], axis=1)
+
+        beta_hist = []
+        for t in range(len(df)):
+            if t < window:
+                beta_hist.append(np.full(H.shape[1], np.nan))
+                continue
+            H_window = H.iloc[t - window:t].values
+            y_window = y.iloc[t - window:t].values
+            beta = np.linalg.pinv(H_window) @ y_window
+            beta_hist.append(beta)
+
+        beta_df = pd.DataFrame(beta_hist, index=df.index, columns=H.columns)
+        beta_var = beta_df.rolling(window).var().clip(lower=min_val).fillna(method="bfill")
+
+        Q_list = [np.diag(row.values) * scale for _, row in beta_var.iterrows()]
+        self.process_noise_fn = lambda t: Q_list[min(t, len(Q_list) - 1)]
+        self.meta = getattr(self, "meta", {})
+        self.meta["Q_mode"] = f"rolling_beta_var_window_{window}"
+        return self
+
+    def set_Q_from_rolling_residual_vol(
+        self,
+        df: pd.DataFrame,
+        target_col: str,
+        factor_cols: list[str],
+        window: int = 20,
+        scale: float = 1.0,
+        burn: int = 0,
+        min_val: float = 1e-8
+    ) -> 'KalmanSpec':
+        """
+        Runs a Kalman filter with the current spec, collects residuals,
+        then builds a time-varying Q_t matrix using rolling residual variance.
+
+        Parameters:
+            df: full DataFrame
+            target_col: column name of the target return
+            factor_cols: list of factor names
+            window: rolling window size
+            scale: scalar multiplier applied to residual variance
+            burn: drop-initial observations
+            min_val: clip variance to floor
+
+        Returns:
+            Updated KalmanSpec with dynamic process_noise_fn
+        """
+        engine = KalmanEngine(self.copy())
+        results = engine.run(df, target_col=target_col, factor_cols=factor_cols, burn=burn)
+        residuals = results["residuals"]
+
+        var_series = residuals.rolling(window).var().clip(lower=min_val).fillna(method="bfill")
+        Q_list = [np.eye(self.K) * v * scale for v in var_series]
+
+        self.process_noise_fn = lambda t: Q_list[min(t, len(Q_list) - 1)]
+        self.meta = getattr(self, "meta", {})
+        self.meta["Q_mode"] = f"rolling_resid_var_from_filter_window_{window}"
+        return self
+
+    def set_R_from_ols(self, H: pd.DataFrame, y: pd.Series) -> 'KalmanSpec':
+        H_mat = H.copy()
+        if self.has_intercept:
+            H_mat = pd.concat([pd.Series(1.0, index=H.index, name="Intercept"), H], axis=1)
+        beta_ols = np.linalg.pinv(H_mat.values) @ y.values
+        residuals = y.values - H_mat.values @ beta_ols
+        R = np.var(residuals)
+        self.obs_noise_fn = lambda t: np.array([[R]])
+        return self
+
+    def set_R_from_rolling_factor_vols(self, H: pd.DataFrame, window: int = 20, min_val: float = 1e-6) -> 'KalmanSpec':
+        avg_vol = H.rolling(window).std().mean(axis=1)
+        R_series = (avg_vol ** 2).clip(lower=min_val).fillna(method="bfill")
+        self.obs_noise_fn = lambda t: np.array([[R_series.iloc[t]]])
+        self.meta = getattr(self, "meta", {})
+        self.meta["R_mode"] = f"factor_vol_window_{window}"
+        return self
+
+    def set_Q_from_mle(self, df: pd.DataFrame, target_col: str, factor_cols: list[str], burn: int = 0) -> 'KalmanSpec':
         best_Q, _ = estimate_mle_Q(self.copy(), df, target_col, factor_cols, burn=burn)
         self.process_noise_fn = lambda t: np.eye(self.K) * best_Q
         self.meta = getattr(self, "meta", {})
         self.meta["Q_scalar"] = best_Q
         return self
 
-    def set_R_from_mle(self, df, target_col, factor_cols, burn=0):
+    def set_R_from_mle(self, df: pd.DataFrame, target_col: str, factor_cols: list[str], burn: int = 0) -> 'KalmanSpec':
         best_R, _ = estimate_mle_R(self.copy(), df, target_col, factor_cols, burn=burn)
         self.obs_noise_fn = lambda t: np.array([[best_R]])
         self.meta = getattr(self, "meta", {})
         self.meta["R_scalar"] = best_R
         return self
-
-    def set_Q_from_factor_vols(self, H):
-        Q = np.diag(np.var(H, axis=0))
-        if self.has_intercept:
-            Q = np.pad(Q, ((1, 0), (1, 0)), mode="constant")
-        self.process_noise_fn = lambda t: Q
-        return self
-
-    def set_R_from_ols(self, H, y):
-        if self.has_intercept:
-            H = np.hstack([np.ones((H.shape[0], 1)), H])
-        beta_ols = np.linalg.pinv(H) @ y
-        residuals = y - H @ beta_ols
-        R = np.var(residuals)
-        self.obs_noise_fn = lambda t: np.array([[R]])
-        return self
     
-    def set_R_from_rolling_factor_vols(spec, H: pd.DataFrame, window: int = 20, min_val: float = 1e-6):
+    def set_R_from_rolling_ols_residuals(self, df: pd.DataFrame, target_col: str, factor_cols: list[str], window: int = 20, min_val: float = 1e-6) -> 'KalmanSpec':
         """
-        Sets R_t as a function of rolling average factor volatility.
-        
+        Sets R_t from rolling window OLS residual variance.
+
         Parameters:
-            spec: KalmanSpec instance
-            H: DataFrame of factor returns (T × K)
-            window: rolling window size
-            min_val: floor value to avoid zero variance
+            df: full DataFrame with both target and factor columns
+            target_col: name of the target return column
+            factor_cols: list of factor column names
+            window: rolling window size for OLS
+            min_val: lower bound on R_t to avoid zero variance
 
         Returns:
-            Updated KalmanSpec with obs_noise_fn set dynamically
+            Updated KalmanSpec with time-varying R_t
         """
-        avg_vol = H.rolling(window).std().mean(axis=1)
-        R_series = (avg_vol ** 2).clip(lower=min_val).fillna(method="bfill")
+        y = df[target_col]
+        H = df[factor_cols]
 
-        spec.obs_noise_fn = lambda t: np.array([[R_series.iloc[t]]])
-        spec.meta = getattr(spec, "meta", {})
-        spec.meta["R_mode"] = f"factor_vol_window_{window}"
-        return spec
-
-    def set_initial_state_from_ols(self, H, y):
         if self.has_intercept:
-            H = np.hstack([np.ones((H.shape[0], 1)), H])
-        beta_ols = np.linalg.pinv(H) @ y
-        self.beta_0 = beta_ols
+            H = pd.concat([pd.Series(1.0, index=H.index, name="Intercept"), H], axis=1)
+
+        R_vals = []
+        for t in range(len(df)):
+            if t < window:
+                R_vals.append(np.nan)
+                continue
+
+            H_window = H.iloc[t - window:t]
+            y_window = y.iloc[t - window:t]
+            beta = np.linalg.pinv(H_window.values) @ y_window.values
+            resid = y_window.values - H_window.values @ beta
+            R_t = np.var(resid)
+            R_vals.append(max(R_t, min_val))
+
+        R_series = pd.Series(R_vals, index=df.index).fillna(method="bfill")
+        self.obs_noise_fn = lambda t: np.array([[R_series.iloc[t]]])
+        self.meta = getattr(self, "meta", {})
+        self.meta["R_mode"] = f"rolling_ols_window_{window}"
         return self
 
-    def validate(self, y, H):
+
+    def validate(self, y: np.ndarray, H: np.ndarray):
         assert y.ndim == 2 and y.shape[1] == 1
         assert H.ndim == 2
         assert H.shape[0] == y.shape[0]
         assert H.shape[1] == self.K or H.shape[1] == self.K - 1
 
-    def describe(self, target_col, factor_cols):
-        return {
-            "model_name": self.name,
-            "target_col": target_col,
-            "factor_cols": factor_cols,
-            "K": self.K,
-            "has_intercept": self.has_intercept
+    def describe(self, target_col: str, factor_cols: list[str]) -> dict:
+        self.meta = getattr(self, "meta", {})
+        desc = {
+            "Model Name": self.name,
+            "K (State Dim)": self.K,
+            "Has Intercept": self.has_intercept,
+            "Factor Columns": factor_cols,
+            "Initial Beta": self.beta_0.flatten().tolist(),
+            "Initial Covariance (P_0 diag)": np.diag(self.P_0).tolist(),
+            "Q Type": "dynamic" if callable(self.process_noise_fn) else "constant",
+            "R Type": "dynamic" if callable(self.obs_noise_fn) else "constant",
+            "Q Scalar": self.meta.get("Q_scalar", None),
+            "R Scalar": self.meta.get("R_scalar", None),
+            "Q Mode": self.meta.get("Q_mode", None),
+            "R Mode": self.meta.get("R_mode", None),
+            "Observation Function": str(type(self.observation_fn)),
+            "Transition Function": str(type(self.transition_fn))
         }
+        return desc
 
-    def copy(self):
+    def copy(self) -> 'KalmanSpec':
         new_spec = KalmanSpec(K=self.K, name=self.name)
         new_spec.beta_0 = self.beta_0.copy()
         new_spec.P_0 = self.P_0.copy()
@@ -151,9 +266,8 @@ class KalmanSpec:
         new_spec.process_noise_fn = self.process_noise_fn
         new_spec.observation_fn = self.observation_fn
         new_spec.obs_noise_fn = self.obs_noise_fn
-        new_spec.has_intercept = getattr(self, "has_intercept", False)
+        new_spec.has_intercept = self.has_intercept
         return new_spec
-
 
 class KalmanEngine:
     def __init__(self, spec):
@@ -201,6 +315,12 @@ class KalmanEngine:
             S = H_obs_t @ P_pred @ H_obs_t.T + R_t
             K_t = P_pred @ H_obs_t.T @ np.linalg.inv(S)
 
+            # Use Kalman gain to update the state and get a new posterior
+            # We will end up with with a posteior that is a mix of the prior and the observation
+            # The more uncertain the observation is, the more we trust the prior
+            # The more uncertain the prior is, the more we trust the observation
+            # Prior uncertainty is given by P_pred and is a function of Q_t and T_t and beta_prev and P_prev
+            # Observation uncertainty is given by S and is a function of R_t
             beta_post = beta_pred + K_t @ innovation
             P_post = (np.eye(K) - K_t @ H_obs_t) @ P_pred
 
