@@ -339,8 +339,8 @@ def summarize_model_diagnostics(results: dict) -> pd.DataFrame:
     mean_drift_norm = drift.mean() if drift is not None else np.nan
 
     return pd.DataFrame([{
-        "Model Name": meta.get("model_name", "Unknown"),
-        "Target": meta.get("target_col", "y"),
+        "Model Name": meta.get("Model Name", "Unknown"),
+        "Target": meta.get("Target Column", "y"),
         "Date Range": date_range,
         "# Observations": n_obs,
         "Final RMSE": round(final_rmse, 6),
@@ -388,7 +388,8 @@ def summarize_factor_dynamics(results: dict) -> pd.DataFrame:
         z_score = (final_beta - mean_beta) / std_beta if std_beta > 0 else np.nan
 
         row = {
-            "Model Name": meta.get("model_name", "Unknown"),
+            "Model Name": meta.get("Model Name", "Unknown"),
+            "Target": meta.get("Target Column", "y"),
             "Factor": factor,
             "Avg Beta": mean_beta,
             "Beta Std": std_beta,
