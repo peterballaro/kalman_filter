@@ -3,8 +3,11 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
-from viz.viz_tools import get_sci_template, attach_line_end_labels
-
+from utils.viz_utils import get_sci_template, attach_line_end_labels, hex_to_rgba
+from filters.kalman import KalmanEngine, KalmanSpec
+from typing import Optional, Union, List, Dict, Callable
+from itertools import product
+import plotly.express as px
 # Register the template globally
 pio.templates["sci_template"] = get_sci_template()
 
@@ -22,6 +25,24 @@ ALL_PANELS = DEFAULT_PANELS + [
     "residual_hist",
     "cumulative_resid"
 ]
+
+
+DEFAULT_Q_SETTERS = {
+    "const": lambda spec, df, y, X: spec.set_Q_from_mle(df, y, X),
+    "resid_var": lambda spec, df, y, X: spec.set_Q_from_rolling_residual_vol(df, y, X),
+    "beta_var": lambda spec, df, y, X: spec.set_Q_from_rolling_beta_var(df, y, X)
+}
+
+DEFAULT_R_SETTERS = {
+    "ols": lambda spec, df, y, X: spec.set_R_from_ols(df[X], df[y]),
+    "rolling_vol": lambda spec, df, y, X: spec.set_R_from_rolling_factor_vols(df[X]),
+    "mle": lambda spec, df, y, X: spec.set_R_from_mle(df, y, X)
+}
+
+DEFAULT_INIT_SETTERS = {
+    "ols": lambda spec, df, y, X: spec.set_initial_state_from_ols(df[X], df[y])
+}
+
 
 def drop_static_components(df: pd.DataFrame, exclude: list[str] = ["Intercept"]) -> pd.DataFrame:
     return df.drop(columns=[c for c in exclude if c in df.columns], errors="ignore")
@@ -321,8 +342,7 @@ def summarize_model_diagnostics(results: dict) -> pd.DataFrame:
     index = residuals.index
     n_obs = len(residuals)
     date_range = f"{index[0].date()} → {index[-1].date()}"
-
-    rmse_series = (residuals**2).rolling(window=1).mean().apply(np.sqrt)
+    rmse_series = np.sqrt((residuals**2).expanding().mean())
     final_rmse = rmse_series.iloc[-1]
     mean_rmse = np.sqrt(np.mean(residuals**2))
     sse = np.sum(residuals**2)
@@ -354,38 +374,34 @@ def summarize_model_diagnostics(results: dict) -> pd.DataFrame:
 
 def summarize_factor_dynamics(results: dict) -> pd.DataFrame:
     """
-    Returns a one-row-per-factor DataFrame summarizing the behavior of each factor
-    in a Kalman filter run. Requires 'beta', 'kalman_gain', and 'H' in the results dict.
-    
-    Columns:
-        - Factor: Name of the factor
-        - Avg Beta: Mean exposure to the factor across time
-        - Beta Std: Std dev of the exposure across time
-        - Final Beta: Last estimated exposure
-        - Beta Z-Score: Final beta, standardized relative to its own history
-        - Min Beta / Max Beta: Historical extremes in beta
-        - Drift Volatility: Std dev of βₜ - βₜ₋₁ (how much the exposure moves)
-        - Mean Gain: Avg Kalman gain (sensitivity to new info)
-        - Avg Contribution: Mean of Hₜₖ × βₜₖ (contribution to predicted y)
-        - Final Contribution: Last value of Hₜₖ × βₜₖ
+    Robust to models with an intercept. If a factor (e.g. 'Intercept') is in beta
+    but not in H, contribution-related fields will be set to NaN.
     """
-    beta = results["beta"]  # T × K DataFrame
-    gains = results.get("kalman_gain")  # T × K DataFrame or None
-    H = results["H"]  # T × K DataFrame
+    beta = results["beta"]        # T × K DataFrame
+    gains = results.get("kalman_gain")      # T × K DataFrame or None
+    H = results.get("H")                    # T × K DataFrame
     meta = results.get("meta", {})
     summaries = []
 
     for factor in beta.columns:
-        beta_k = beta[factor]        # exposure time series for factor k
-        H_k = H[factor]              # corresponding factor returns
-        drift = beta_k.diff().dropna()      # βₜ - βₜ₋₁
-        contrib = beta_k * H_k              # Hₜₖ × βₜₖ
+        beta_k = beta[factor]
+        drift = beta_k.diff().dropna()
         gain_k = gains[factor] if gains is not None and factor in gains.columns else None
 
-        mean_beta = beta_k.mean()           # average exposure over time
-        std_beta = beta_k.std()             # variability of exposure
-        final_beta = beta_k.iloc[-1]        # latest exposure
+        mean_beta = beta_k.mean()
+        std_beta = beta_k.std()
+        final_beta = beta_k.iloc[-1]
         z_score = (final_beta - mean_beta) / std_beta if std_beta > 0 else np.nan
+
+        # Contribution-safe handling
+        if H is not None and factor in H.columns:
+            H_k = H[factor]
+            contrib = beta_k * H_k
+            avg_contrib = contrib.mean()
+            final_contrib = contrib.iloc[-1]
+        else:
+            avg_contrib = np.nan
+            final_contrib = np.nan
 
         row = {
             "Model Name": meta.get("Model Name", "Unknown"),
@@ -397,15 +413,16 @@ def summarize_factor_dynamics(results: dict) -> pd.DataFrame:
             "Beta Z-Score": z_score,
             "Min Beta": beta_k.min(),
             "Max Beta": beta_k.max(),
-            "Drift Volatility": drift.std(),  # how much exposure moves step to step
+            "Drift Volatility": drift.std(),
             "Mean Gain": gain_k.mean() if gain_k is not None else np.nan,
-            "Avg Contribution": contrib.mean(),      # avg influence on prediction
-            "Final Contribution": contrib.iloc[-1]   # last-period influence on prediction
+            "Avg Contribution": avg_contrib,
+            "Final Contribution": final_contrib
         }
 
         summaries.append(row)
 
     return pd.DataFrame(summaries)
+
 
 def plot_factor_contributions(results: dict, include_factors: list[str] | None = None) -> go.Figure:
     """
@@ -606,5 +623,252 @@ def plot_beta_grid(results: dict, n_cols: int = 3, show_gain: bool = False) -> g
 
     return fig
 
+class FundRunner:
+    def __init__(self, df, fund_col, factor_cols, burn=12):
+        self.df = df
+        self.fund_col = fund_col
+        self.factor_cols = factor_cols
+        self.burn = burn
+
+    def run(self, spec: KalmanSpec, label: str = "default") -> dict:
+        engine = KalmanEngine(spec)
+        results = engine.run(
+            df=self.df,
+            target_col=self.fund_col,
+            factor_cols=self.factor_cols,
+            burn=self.burn
+        )
+        results["meta"]["Fund"] = self.fund_col
+        results["meta"]["Spec Label"] = label
+        return results
+
+class ModelComparisonEngine:
+    def __init__(self, df, fund_cols, factor_cols, burn=12):
+        self.df = df
+        self.fund_cols = fund_cols
+        self.factor_cols = factor_cols
+        self.burn = burn
+        self.results = {}
+
+    def run_all(self, q_setters=None, r_setters=None, init_setters=None):
+        for fund in self.fund_cols:
+            print(f"Running Kalman filter for {fund}...")
+            spec = KalmanSpec(K=len(self.factor_cols)).set_intercept()
+            fund_runner = FundRunner(self.df, fund, self.factor_cols, self.burn)
+            grid = run_kalman_grid_search(
+                df=self.df,
+                target_col=fund,
+                factor_cols=self.factor_cols,
+                base_spec=spec,
+                q_setters=q_setters,
+                r_setters=r_setters,
+                init_setters=init_setters,
+                burn=self.burn
+            )
+            best_row = grid.iloc[0]
+            best_spec = KalmanSpec(K=len(self.factor_cols)).set_intercept()
+            best_spec.name = best_row["Model Name"]
+            results = fund_runner.run(best_spec, label=best_row["Model Name"])
+            self.results[fund] = {
+                "grid_summary": grid,
+                "best_row": best_row,
+                "results": results
+            }
+
+    def get_best_specs(self):
+        return {fund: result["best_row"] for fund, result in self.results.items()}
+
+    def get_all_summaries(self):
+        summary_frames = []
+        for fund, result in self.results.items():
+            summary = result["grid_summary"].copy()
+            summary["Fund"] = fund
+            summary_frames.append(summary)
+        return pd.concat(summary_frames, ignore_index=True)
+
+    def compare_exposures(self):
+        comparison_frames = []
+        for fund, result in self.results.items():
+            summary = summarize_factor_dynamics(result["results"])
+            summary["Fund"] = fund
+            comparison_frames.append(summary)
+        return pd.concat(comparison_frames, ignore_index=True)
+
+    def get_results(self, fund: str) -> Optional[dict]:
+        return self.results.get(fund, {}).get("results")
+
+    def stack_betas(self) -> pd.DataFrame:
+        """Stack all beta paths across funds for overlaid plotting."""
+        betas = []
+        for fund, result in self.results.items():
+            df_beta = result["results"]["beta"].copy()
+            df_beta.columns = [f"{col} ({fund})" for col in df_beta.columns]
+            betas.append(df_beta)
+        return pd.concat(betas, axis=1) if betas else pd.DataFrame()
+
+    def plot_all_stacked_betas(
+        self,
+        show_std: bool = True,
+        n_cols: int = 2,
+        factors: list[str] | None = None
+    ) -> go.Figure:
+        """
+        Grid of subplots for each factor, showing all fund beta paths.
+        Colors are consistent across subplots per fund.
+        Ribbons are legend-grouped to their lines and reflect posterior uncertainty (±1σ).
+        """
+        if not self.results:
+            raise ValueError("No results to plot. Run `.run_all()` first.")
+
+        selected_factors = factors if factors is not None else self.factor_cols
+        n_factors = len(selected_factors)
+        cols = min(n_cols, n_factors)
+        rows = int(np.ceil(n_factors / cols))
+
+        fig = make_subplots(
+            rows=rows,
+            cols=cols,
+            subplot_titles=selected_factors,
+            shared_xaxes=False,
+            shared_yaxes=False,
+            vertical_spacing=0.1,
+            horizontal_spacing=0.05
+        )
+
+        fund_names = list(self.results.keys())
+        color_map = {fund: color for fund, color in zip(fund_names, px.colors.qualitative.Plotly)}
+
+        line_end_map = {}
+
+        for i, factor in enumerate(selected_factors):
+            row = i // cols + 1
+            col = i % cols + 1
+            trace_names = []
+
+            for fund, result in self.results.items():
+                beta_df = result["results"]["beta"]
+                beta_cov = result["results"]["beta_cov"]
+
+                if factor not in beta_df.columns:
+                    continue
+
+                series = beta_df[factor]
+                index = beta_df.index
+                factor_idx = beta_df.columns.get_loc(factor)
+
+                std_series = pd.Series(
+                    [np.sqrt(P[factor_idx, factor_idx]) for P in beta_cov.values()],
+                    index=series.index
+                )
+                upper = series + std_series
+                lower = series - std_series
+
+                # Line trace
+                trace = go.Scatter(
+                    x=index,
+                    y=series,
+                    mode="lines",
+                    name=fund,
+                    legendgroup=fund,
+                    showlegend=(i == 0),
+                    line=dict(width=2, color=color_map[fund]),
+                    hovertemplate="%{x|%Y-%m-%d}<br>Beta: %{y:.3f}<extra>" + fund + "</extra>"
+                )
+                fig.add_trace(trace, row=row, col=col)
+                trace_names.append(fund)
+
+                # Uncertainty ribbon
+                if show_std:
+                    band = go.Scatter(
+                        x=list(index) + list(index[::-1]),
+                        y=list(upper) + list(lower[::-1]),
+                        fill="toself",
+                        fillcolor=hex_to_rgba(color_map[fund], alpha=0.15),
+                        line=dict(color="rgba(255,255,255,0)"),
+                        hoverinfo="skip",
+                        showlegend=False,
+                        legendgroup=fund
+                    )
+                    fig.add_trace(band, row=row, col=col)
+
+            line_end_map[f"subplot_{row}_{col}"] = trace_names
+
+        fig.update_layout(
+            height=300 * rows,
+            width=1100,
+            title_text="Kalman Filter Beta Paths per Factor",
+            template="sci_template",
+            showlegend=True,
+            margin=dict(t=60, b=40)
+        )
+
+        attach_line_end_labels(
+            fig,
+            trace_names=sum(line_end_map.values(), []),
+            font_size=12,
+            text_anchor="middle left"
+        )
+
+        return fig
 
 
+def run_kalman_grid_search(
+    df: pd.DataFrame,
+    target_col: str,
+    factor_cols: list[str],
+    base_spec: KalmanSpec,
+    q_setters: dict[str, Callable] = None,
+    r_setters: dict[str, Callable] = None,
+    init_setters: dict[str, Callable] = None,
+    burn: int = 0,
+    try_both_intercepts: bool = True  # NEW: default to True
+) -> pd.DataFrame:
+    """
+    Run every combination of (Q, R, Init, Intercept) settings on a KalmanSpec,
+    and return a summary of model diagnostics.
+    """
+    if q_setters is None:
+        q_setters = DEFAULT_Q_SETTERS
+    if r_setters is None:
+        r_setters = DEFAULT_R_SETTERS
+    if init_setters is None:
+        init_setters = DEFAULT_INIT_SETTERS
+
+    intercept_options = [True, False] if try_both_intercepts else [base_spec.has_intercept]
+    records = []
+
+    for intercept_flag, q_key, r_key, init_key in product(intercept_options, q_setters, r_setters, init_setters):
+        spec = KalmanSpec(K=len(factor_cols))
+        if intercept_flag:
+            spec = spec.set_intercept()
+
+        spec = init_setters[init_key](spec, df, target_col, factor_cols)
+        spec = q_setters[q_key](spec, df, target_col, factor_cols)
+        spec = r_setters[r_key](spec, df, target_col, factor_cols)
+
+        model_name = f"Intercept={'Yes' if intercept_flag else 'No'}, Q={q_key}, R={r_key}, Init={init_key}"
+        spec.name = model_name
+
+        engine = KalmanEngine(spec)
+        try:
+            results = engine.run(df, target_col, factor_cols, burn=burn)
+            summary = summarize_model_diagnostics(results).iloc[0].to_dict()
+            summary["Q Mode"] = spec.meta.get("Q_mode", q_key)
+            summary["R Mode"] = spec.meta.get("R_mode", r_key)
+            summary["Init Mode"] = init_key
+            summary["Intercept"] = intercept_flag
+            records.append(summary)
+        except Exception as e:
+            records.append({
+                "Model Name": model_name,
+                "Target": target_col,
+                "Error": str(e),
+                "Q Mode": q_key,
+                "R Mode": r_key,
+                "Init Mode": init_key,
+                "Intercept": intercept_flag
+            })
+
+    out = pd.DataFrame(records)
+    out = out.sort_values(by='Mean RMSE', ascending=True, na_position="last")
+    return out

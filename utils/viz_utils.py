@@ -4,6 +4,14 @@ import plotly.io as pio
 import plotly.graph_objects as go
 from plotly.graph_objects import Figure
 
+def hex_to_rgba(hex_color: str, alpha: float = 0.15) -> str:
+    """
+    Converts Plotly hex color (e.g. "#636EFA") to rgba string with transparency.
+    """
+    hex_color = hex_color.lstrip('#')
+    r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
 def get_sci_template():
     timestamp = datetime.now().strftime("Generated %Y-%m-%d %H:%M")
 

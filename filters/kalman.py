@@ -1,9 +1,7 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-from typing import Callable
-from itertools import product
-from viz.kalman_viz import summarize_model_diagnostics
+from typing import Optional, Union, List, Dict, Callable
 
 def estimate_mle_R(spec_template, df: pd.DataFrame, target_col: str, factor_cols: list[str], burn: int = 0,
                     method: str = 'L-BFGS-B', bounds: tuple = (1e-6, 1e2)) -> tuple[float, minimize]:
@@ -61,7 +59,7 @@ class KalmanSpec:
         self.obs_noise_fn: Callable[[int], np.ndarray] = lambda t: np.eye(1) * 1e-2
         self.has_intercept: bool = False
 
-    def add_intercept(self, init_val: float = 0.0) -> 'KalmanSpec':
+    def set_intercept(self, init_val: float = 0.0) -> 'KalmanSpec':
         self.K += 1
         self.beta_0 = np.insert(self.beta_0, 0, init_val).reshape(-1, 1)
         self.P_0 = np.pad(self.P_0, ((1, 0), (1, 0)), mode="constant")
@@ -356,76 +354,3 @@ class KalmanEngine:
             "meta": self.spec.describe(target_col=target_col, factor_cols=cols),
             "H": pd.DataFrame(H[idx], index=time_index, columns=factor_cols)
         }
-    
-# --- Default Q/R/Init Setter Registries ---
-DEFAULT_Q_SETTERS = {
-    "const": lambda spec, df, y, X: spec.set_Q_from_mle(df, y, X),
-    "resid_var": lambda spec, df, y, X: spec.set_Q_from_rolling_residual_vol(df, y, X),
-    "beta_var": lambda spec, df, y, X: spec.set_Q_from_rolling_beta_var(df, y, X)
-}
-
-DEFAULT_R_SETTERS = {
-    "ols": lambda spec, df, y, X: spec.set_R_from_ols(df[X], df[y]),
-    "rolling_vol": lambda spec, df, y, X: spec.set_R_from_rolling_factor_vols(df[X]),
-    "mle": lambda spec, df, y, X: spec.set_R_from_mle(df, y, X)
-}
-
-DEFAULT_INIT_SETTERS = {
-    "ols": lambda spec, df, y, X: spec.set_initial_state_from_ols(df[X], df[y])
-}
-
-
-def run_kalman_grid_search(
-    df: pd.DataFrame,
-    target_col: str,
-    factor_cols: list[str],
-    base_spec: KalmanSpec,
-    q_setters: dict[str, Callable] = None,
-    r_setters: dict[str, Callable] = None,
-    init_setters: dict[str, Callable] = None,
-    burn: int = 0
-) -> pd.DataFrame:
-    """
-    Run every combination of (Q, R, init) setters on a KalmanSpec,
-    and return a summary of model diagnostics.
-    """
-    if q_setters is None:
-        q_setters = DEFAULT_Q_SETTERS
-    if r_setters is None:
-        r_setters = DEFAULT_R_SETTERS
-    if init_setters is None:
-        init_setters = DEFAULT_INIT_SETTERS
-
-    records = []
-
-    for q_key, r_key, init_key in product(q_setters, r_setters, init_setters):
-        spec = base_spec.copy()
-        spec = init_setters[init_key](spec, df, target_col, factor_cols)
-        spec = q_setters[q_key](spec, df, target_col, factor_cols)
-        spec = r_setters[r_key](spec, df, target_col, factor_cols)
-
-        model_name = f"Q={q_key}, R={r_key}, Init={init_key}"
-        spec.name = model_name
-
-        engine = KalmanEngine(spec)
-        try:
-            results = engine.run(df, target_col, factor_cols, burn=burn)
-            summary = summarize_model_diagnostics(results).iloc[0].to_dict()
-            summary["Q Mode"] = spec.meta.get("Q_mode", q_key)
-            summary["R Mode"] = spec.meta.get("R_mode", r_key)
-            summary["Init Mode"] = init_key
-            
-            records.append(summary)
-        except Exception as e:
-            records.append({
-                "Model Name": model_name,
-                "Target": target_col,
-                "Error": str(e),
-                "Q Mode": q_key,
-                "R Mode": r_key,
-                "Init Mode": init_key
-            })
-    out = pd.DataFrame(records)
-    out = out.sort_values(by='Mean RMSE', ascending=True)
-    return pd.DataFrame(records)
-
